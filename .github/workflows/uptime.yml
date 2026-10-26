@@ -1,0 +1,100 @@
+name: Uptime
+
+# The README advertises a monitoring endpoint; until now nothing watched it.
+# This probes production on a schedule and opens an issue when it is down, so
+# an outage surfaces somewhere other than a user noticing.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  # Never cancel a probe in flight. A run that is cancelled midway through
+  # opening the outage issue records nothing, so the outage it detected is
+  # lost. Monitoring runs to completion or it is not monitoring.
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Probe production
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROBE_URL: https://trainlytics-two.vercel.app/login
+    steps:
+      - name: Check the login route responds
+        id: probe
+        run: |
+          set -uo pipefail
+          # Three attempts: a single blip should not page anyone.
+          for attempt in 1 2 3; do
+            # One request, both values. This previously issued two separate
+            # curls — so the latency reported belonged to a different request
+            # than the status code reported, and the probe hit production twice
+            # as often as it needed to.
+            read -r code elapsed <<<"$(curl -sS -o /dev/null \
+              -w '%{http_code} %{time_total}' -m 30 -L "$PROBE_URL" || echo '000 0')"
+            echo "attempt $attempt: HTTP $code in ${elapsed}s"
+            if [ "$code" = "200" ]; then
+              echo "status=up" >> "$GITHUB_OUTPUT"
+              echo "detail=HTTP $code in ${elapsed}s" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "status=down" >> "$GITHUB_OUTPUT"
+          echo "detail=three consecutive failures, last HTTP $code" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Open or update an outage issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Production probe failing"
+          # The label may not exist yet on a fresh repository; create it once,
+          # ignoring the "already exists" case.
+          gh label create outage --color B60205 \
+            --description "Production is failing its scheduled probe" 2>/dev/null || true
+          existing=$(gh issue list --state open --label outage --search "$title" --json number --jq '.[0].number // empty' || true)
+          # A heredoc, because an indented shell string carries its leading
+          # whitespace into the issue body, and four spaces of indent is a
+          # markdown code block. The outage issue rendered as one.
+          body=$(cat <<EOF
+          The scheduled uptime probe could not reach $PROBE_URL.
+
+          Detail: ${{ steps.probe.outputs.detail }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          See RUNBOOK.md for triage steps.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing. ${{ steps.probe.outputs.detail }} — run ${{ github.run_id }}."
+          else
+            gh issue create --title "$title" --label outage --body "$body"
+          fi
+
+      - name: Close the outage issue once recovered
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A healthy probe must never fail the job. If the label does not exist
+          # yet, or there is no open outage, there is simply nothing to close —
+          # `|| true` keeps gh's non-zero exit in those cases from turning a
+          # green probe red, which is what happened on the first run.
+          existing=$(gh issue list --state open --label outage \
+            --search "Production probe failing" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "${existing:-}" ]; then
+            gh issue comment "$existing" --body "Recovered: ${{ steps.probe.outputs.detail }}."
+            gh issue close "$existing"
+          else
+            echo "Probe healthy; no open outage issue to close."
+          fi

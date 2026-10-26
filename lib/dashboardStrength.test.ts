@@ -1,0 +1,203 @@
+import { describe, expect, it } from "vitest";
+import {
+  aggregateSessionStrengthByDate,
+  buildMuscleGroupStrengthDatasets,
+  buildSelectedExerciseSeries,
+  buildStrengthProgressDatasets,
+  computeProgressDelta,
+  computeRepMultiplier,
+  computeSessionStrength,
+  computeSessionStrengthByExerciseDate,
+  computeSetStrength,
+  computeSetStrengthScore,
+  mapProgressDeltaToScore,
+  mapToProgressGroup,
+  type StrengthSetLog,
+} from "@/lib/dashboardStrength";
+
+describe("dashboardStrength", () => {
+  it("computes rep multiplier by range", () => {
+    expect(computeRepMultiplier(2)).toBe(0.85);
+    expect(computeRepMultiplier(5)).toBe(1);
+    expect(computeRepMultiplier(8)).toBe(1.03);
+    expect(computeRepMultiplier(11)).toBe(0.95);
+    expect(computeRepMultiplier(15)).toBe(0.85);
+  });
+
+  it("computes per-set strength score", () => {
+    expect(computeSetStrengthScore(100, 8)).toBeCloseTo(103, 6);
+  });
+
+  it("computes per-set strength from weight_lb and reps", () => {
+    expect(computeSetStrength(100, 8)).toBeCloseTo(103, 6);
+  });
+
+  it("computes session strength with 40/60 weighting and missing-set fallback", () => {
+    const set1Score = 100 * 1.03;
+    const set2Score = 110 * 1.02;
+    const expectedWeighted = set1Score * 0.5 + set2Score * 0.5;
+
+    expect(
+      computeSessionStrength({
+        set1: { weight_lb: 100, reps: 8 },
+        set2: { weight_lb: 110, reps: 7 },
+      })
+    ).toBeCloseTo(expectedWeighted, 6);
+
+    expect(
+      computeSessionStrength({
+        set1: { weight_lb: 95, reps: 6 },
+      })
+    ).toBeCloseTo(95 * 1.01, 6);
+
+    expect(
+      computeSessionStrength({
+        set2: { weight_lb: 120, reps: 5 },
+      })
+    ).toBeCloseTo(120 * 1.0, 6);
+  });
+
+  it("computes progress delta safely with zero baseline", () => {
+    expect(computeProgressDelta(100, 120)).toBeCloseTo(0.2, 6);
+    expect(computeProgressDelta(0, 0)).toBe(0);
+    expect(computeProgressDelta(0, 100)).toBe(1);
+  });
+
+  it("maps progress delta to 1-7 score thresholds", () => {
+    expect(mapProgressDeltaToScore(0.18)).toBe(7);
+    expect(mapProgressDeltaToScore(0.08)).toBe(6);
+    expect(mapProgressDeltaToScore(0.02)).toBe(5);
+    expect(mapProgressDeltaToScore(0)).toBe(4);
+    expect(mapProgressDeltaToScore(-0.02)).toBe(3);
+    expect(mapProgressDeltaToScore(-0.08)).toBe(2);
+    expect(mapProgressDeltaToScore(-0.18)).toBe(1);
+  });
+
+  it("computes session strength using 40/60 set weighting", () => {
+    const rows: StrengthSetLog[] = [
+      {
+        date: "2026-02-01",
+        exerciseName: "Bench Press",
+        muscleGroup: "Chest",
+        setNumber: 1,
+        weight: 100,
+        reps: 8,
+      },
+      {
+        date: "2026-02-01",
+        exerciseName: "Bench Press",
+        muscleGroup: "Chest",
+        setNumber: 2,
+        weight: 110,
+        reps: 7,
+      },
+    ];
+
+    const [session] = computeSessionStrengthByExerciseDate(rows);
+    const set1 = 100 * 1.03;
+    const set2 = 110 * 1.02;
+    expect(session.sessionStrength).toBeCloseTo(set1 * 0.5 + set2 * 0.5, 6);
+  });
+
+  it("maps muscle groups to push/pull/legs", () => {
+    expect(mapToProgressGroup("Chest")).toBe("push");
+    expect(mapToProgressGroup("Back")).toBe("pull");
+    expect(mapToProgressGroup("Hamstring")).toBe("legs");
+    expect(mapToProgressGroup("Abs")).toBe("other");
+  });
+
+  it("builds progress datasets and selected exercise series", () => {
+    const rows: StrengthSetLog[] = [
+      {
+        date: "2026-02-01",
+        exerciseName: "Bench Press",
+        muscleGroup: "Chest",
+        setNumber: 1,
+        weight: 100,
+        reps: 8,
+      },
+      {
+        date: "2026-02-01",
+        exerciseName: "Bench Press",
+        muscleGroup: "Chest",
+        setNumber: 2,
+        weight: 110,
+        reps: 7,
+      },
+      {
+        date: "2026-02-01",
+        exerciseName: "Lat Pulldown",
+        muscleGroup: "Back",
+        setNumber: 1,
+        weight: 120,
+        reps: 6,
+      },
+      {
+        date: "2026-02-08",
+        exerciseName: "Bench Press",
+        muscleGroup: "Chest",
+        setNumber: 1,
+        weight: 105,
+        reps: 8,
+      },
+    ];
+
+    const sessionScores = computeSessionStrengthByExerciseDate(rows);
+    const overall = aggregateSessionStrengthByDate(
+      sessionScores.map((row) => ({ date: row.date, sessionStrength: row.sessionStrength })),
+      "sum"
+    );
+    expect(overall).toHaveLength(2);
+
+    const datasets = buildStrengthProgressDatasets(sessionScores, "sum");
+    expect(datasets.exerciseNames).toContain("Bench Press");
+    expect(datasets.push.length).toBeGreaterThan(0);
+    expect(datasets.pull.length).toBeGreaterThan(0);
+
+    const benchSeries = buildSelectedExerciseSeries(sessionScores, "Bench Press", "sum");
+    expect(benchSeries).toHaveLength(2);
+  });
+
+  it("builds muscle-group datasets using top 2 exercises and excludes pull-up from back", () => {
+    const rows: StrengthSetLog[] = [
+      { date: "2026-02-01", exerciseName: "Pull Up", muscleGroup: "Back", setNumber: 1, weight: 100, reps: 5 },
+      { date: "2026-02-08", exerciseName: "Pull Up", muscleGroup: "Back", setNumber: 1, weight: 100, reps: 5 },
+      { date: "2026-02-01", exerciseName: "Barbell Row", muscleGroup: "Back", setNumber: 1, weight: 150, reps: 6 },
+      { date: "2026-02-08", exerciseName: "Barbell Row", muscleGroup: "Back", setNumber: 1, weight: 155, reps: 6 },
+      { date: "2026-02-15", exerciseName: "Barbell Row", muscleGroup: "Back", setNumber: 1, weight: 160, reps: 6 },
+      { date: "2026-02-01", exerciseName: "Seated Row", muscleGroup: "Back", setNumber: 1, weight: 130, reps: 8 },
+      { date: "2026-02-08", exerciseName: "Seated Row", muscleGroup: "Back", setNumber: 1, weight: 135, reps: 8 },
+      { date: "2026-02-01", exerciseName: "Lat Pulldown", muscleGroup: "Back", setNumber: 1, weight: 120, reps: 8 },
+      { date: "2026-02-01", exerciseName: "Preacher Curl", muscleGroup: "Bicep", setNumber: 1, weight: 60, reps: 10 },
+    ];
+
+    const sessionScores = computeSessionStrengthByExerciseDate(rows);
+    const datasets = buildMuscleGroupStrengthDatasets(sessionScores, "sum", 2);
+
+    expect(datasets.selectedExercisesByMuscleGroup.back).toEqual(["Barbell Row", "Seated Row"]);
+    expect(datasets.selectedExercisesByMuscleGroup.back).not.toContain("Pull Up");
+    expect(datasets.selectedExercisesByMuscleGroup.back).not.toContain("Lat Pulldown");
+    expect(datasets.seriesByMuscleGroup.back.length).toBeGreaterThan(0);
+    expect(datasets.seriesByMuscleGroup.bicep.length).toBeGreaterThan(0);
+  });
+
+  it("prefers recent active exercises over stale archived ones when selecting muscle-group trends", () => {
+    const rows: StrengthSetLog[] = [
+      { date: "2026-02-01", exerciseName: "Overhead Tricep Press", muscleGroup: "Tricep", setNumber: 1, weight: 70, reps: 10 },
+      { date: "2026-02-08", exerciseName: "Overhead Tricep Press", muscleGroup: "Tricep", setNumber: 1, weight: 75, reps: 10 },
+      { date: "2026-02-15", exerciseName: "Triceps Push Down", muscleGroup: "Tricep", setNumber: 1, weight: 80, reps: 10 },
+      { date: "2026-02-22", exerciseName: "Overhead Cable Extension", muscleGroup: "Tricep", setNumber: 1, weight: 45, reps: 12 },
+    ];
+
+    const sessionScores = computeSessionStrengthByExerciseDate(rows);
+    const datasets = buildMuscleGroupStrengthDatasets(sessionScores, "sum", 1, {
+      exerciseIsArchivedByName: {
+        "Overhead Tricep Press": true,
+        "Triceps Push Down": false,
+        "Overhead Cable Extension": false,
+      },
+    });
+
+    expect(datasets.selectedExercisesByMuscleGroup.tricep).toEqual(["Overhead Cable Extension"]);
+  });
+});
